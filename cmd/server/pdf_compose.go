@@ -3,13 +3,16 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"image"
 	_ "image/gif"
 	"image/jpeg"
 	_ "image/png"
+	"log"
 	"math"
 	"mime/multipart"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -58,6 +61,8 @@ func composeInvoice2Up(ctx context.Context, fileHeaders []*multipart.FileHeader)
 	pdf.SetMargins(0, 0, 0)
 	pdf.SetAutoPageBreak(false, 0)
 
+	imp := gofpdi.NewImporter()
+
 	pageW, pageH := 210.0, 297.0
 	halfH := pageH / 2
 	slotW := pageW - 2*composeMarginMM
@@ -66,12 +71,18 @@ func composeInvoice2Up(ctx context.Context, fileHeaders []*multipart.FileHeader)
 	for i := 0; i < len(pages); i += 2 {
 		pdf.AddPage()
 
-		placePageInSlot(pdf, &pages[i], composeMarginMM, composeMarginMM, slotW, slotH)
+		if err := placePageInSlot(pdf, imp, &pages[i], composeMarginMM, composeMarginMM, slotW, slotH); err != nil {
+			cleanup()
+			return "", nil, fmt.Errorf("page %d: %w", i+1, err)
+		}
 
 		drawDashLine(pdf, composeMarginMM, halfH, pageW-composeMarginMM, halfH)
 
 		if i+1 < len(pages) {
-			placePageInSlot(pdf, &pages[i+1], composeMarginMM, halfH+composeMarginMM, slotW, slotH)
+			if err := placePageInSlot(pdf, imp, &pages[i+1], composeMarginMM, halfH+composeMarginMM, slotW, slotH); err != nil {
+				cleanup()
+				return "", nil, fmt.Errorf("page %d: %w", i+2, err)
+			}
 		}
 	}
 
@@ -125,14 +136,22 @@ func composeIdCard(ctx context.Context, fileHeaders []*multipart.FileHeader) (st
 	pdf.SetAutoPageBreak(false, 0)
 	pdf.AddPage()
 
+	imp := gofpdi.NewImporter()
+
 	pageW, pageH := 210.0, 297.0
 	halfH := pageH / 2
 	cardX := (pageW - idCardWidthMM) / 2
 	card1Y := (halfH - idCardHeightMM) / 2
 	card2Y := halfH + (halfH-idCardHeightMM)/2
 
-	placePageInSlot(pdf, &pages[0], cardX, card1Y, idCardWidthMM, idCardHeightMM)
-	placePageInSlot(pdf, &pages[1], cardX, card2Y, idCardWidthMM, idCardHeightMM)
+	if err := placePageInSlot(pdf, imp, &pages[0], cardX, card1Y, idCardWidthMM, idCardHeightMM); err != nil {
+		cleanup()
+		return "", nil, fmt.Errorf("front: %w", err)
+	}
+	if err := placePageInSlot(pdf, imp, &pages[1], cardX, card2Y, idCardWidthMM, idCardHeightMM); err != nil {
+		cleanup()
+		return "", nil, fmt.Errorf("back: %w", err)
+	}
 
 	outPath := filepath.Join(tmpDir, "idcard_composed.pdf")
 	if err := pdf.OutputFileAndClose(outPath); err != nil {
@@ -307,8 +326,16 @@ func collectPages(ctx context.Context, fileHeaders []*multipart.FileHeader, tmpD
 			if err != nil {
 				numPages = 1
 			}
-			for p := 1; p <= numPages; p++ {
-				pages = append(pages, composePage{pdfPath: localPath, pageNo: p})
+			if canGofpdiParse(localPath) {
+				for p := 1; p <= numPages; p++ {
+					pages = append(pages, composePage{pdfPath: localPath, pageNo: p})
+				}
+			} else {
+				imgPages, err := renderPDFToImages(ctx, localPath, numPages, tmpDir)
+				if err != nil {
+					return nil, fmt.Errorf("cannot process PDF %s: %w", fh.Filename, err)
+				}
+				pages = append(pages, imgPages...)
 			}
 
 		case fileKindOFD:
@@ -357,7 +384,7 @@ func collectPages(ctx context.Context, fileHeaders []*multipart.FileHeader, tmpD
 	return pages, nil
 }
 
-func placePageInSlot(pdf *gofpdf.Fpdf, page *composePage, slotX, slotY, slotW, slotH float64) {
+func placePageInSlot(pdf *gofpdf.Fpdf, imp *gofpdi.Importer, page *composePage, slotX, slotY, slotW, slotH float64) (err error) {
 	if page.imgPath != "" {
 		imgW := float64(page.imgCfg.Width)
 		imgH := float64(page.imgCfg.Height)
@@ -371,11 +398,16 @@ func placePageInSlot(pdf *gofpdf.Fpdf, page *composePage, slotX, slotY, slotW, s
 		y := slotY + (slotH-h)/2
 		opts := gofpdf.ImageOptions{ImageType: "", ReadDpi: true}
 		pdf.ImageOptions(page.imgPath, x, y, w, h, false, opts, 0, "")
-		return
+		return nil
 	}
 
 	if page.pdfPath != "" {
-		imp := gofpdi.NewImporter()
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("failed to import PDF %s: %v", filepath.Base(page.pdfPath), r)
+			}
+		}()
+
 		tplId := imp.ImportPage(pdf, page.pdfPath, page.pageNo, "/MediaBox")
 		sizes := imp.GetPageSizes()
 		srcW, srcH := 210.0, 297.0
@@ -399,6 +431,7 @@ func placePageInSlot(pdf *gofpdf.Fpdf, page *composePage, slotX, slotY, slotW, s
 		y := slotY + (slotH-h)/2
 		imp.UseImportedTemplate(pdf, tplId, x, y, w, h)
 	}
+	return nil
 }
 
 func drawDashLine(pdf *gofpdf.Fpdf, x1, y1, x2, y2 float64) {
@@ -408,6 +441,58 @@ func drawDashLine(pdf *gofpdf.Fpdf, x1, y1, x2, y2 float64) {
 	pdf.Line(x1, y1, x2, y2)
 	pdf.SetDashPattern([]float64{}, 0)
 	pdf.SetDrawColor(0, 0, 0)
+}
+
+func canGofpdiParse(pdfPath string) (ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			ok = false
+		}
+	}()
+	imp := gofpdi.NewImporter()
+	pdf := gofpdf.New("P", "mm", "A4", "")
+	imp.ImportPage(pdf, pdfPath, 1, "/MediaBox")
+	return true
+}
+
+func renderPDFToImages(ctx context.Context, pdfPath string, numPages int, tmpDir string) ([]composePage, error) {
+	gsBin, err := exec.LookPath("gs")
+	if err != nil {
+		return nil, fmt.Errorf("ghostscript not found, cannot render PDF to images")
+	}
+
+	log.Printf("[compose] gofpdi cannot parse %s, falling back to gs rendering (%d pages)", filepath.Base(pdfPath), numPages)
+
+	var pages []composePage
+	for p := 1; p <= numPages; p++ {
+		seq := atomic.AddUint64(&downscaleSeq, 1)
+		outPath := filepath.Join(tmpDir, fmt.Sprintf("pdfrender_%d.jpg", seq))
+
+		args := []string{
+			"-dNOPAUSE", "-dBATCH", "-dSAFER", "-dQUIET",
+			"-sDEVICE=jpeg", "-dJPEGQ=95", "-r300",
+			fmt.Sprintf("-dFirstPage=%d", p),
+			fmt.Sprintf("-dLastPage=%d", p),
+			"-sOutputFile=" + outPath,
+			pdfPath,
+		}
+		cmd := exec.CommandContext(ctx, gsBin, args...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return nil, fmt.Errorf("gs render page %d failed: %w - %s", p, err, string(out))
+		}
+
+		f, err := os.Open(outPath)
+		if err != nil {
+			return nil, err
+		}
+		cfg, _, err := image.DecodeConfig(f)
+		f.Close()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read rendered image: %w", err)
+		}
+		pages = append(pages, composePage{imgPath: outPath, imgCfg: cfg})
+	}
+	return pages, nil
 }
 
 func copyFile(src, dst string) error {
